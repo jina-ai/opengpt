@@ -64,6 +64,7 @@ class GenerationMixin:
         stop_str: Optional[str] = None,
         stop_token_ids: List[int] = [],
         past_key_values: Optional[Iterable[torch.Tensor]] = None,
+        truncate_last_token: bool = False,
         **kwargs,
     ):
         """Generate tokens in a streaming fashion. This method is a modified version of `fastchat.server.inference.generate_stream`.
@@ -80,6 +81,7 @@ class GenerationMixin:
         :param stop_str: If not None, the model will stop generating when the generated tokens end with this string.
         :param stop_token_ids: A list of token ids that will cause the model to stop generating.
         :param past_key_values: A list of past key values to use for generation. If None, the model will generate from scratch.
+        :param truncate_last_token: whether to truncate the last token of input. Only used for prefilling input.
         :param kwargs: Additional keyword arguments to pass to the model.
         :return:
         """
@@ -87,6 +89,13 @@ class GenerationMixin:
         input_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"].to(
             self._device
         )
+        if truncate_last_token:
+            input_ids = torch.unsqueeze(
+                torch.cat(
+                    (input_ids[0][:-2], torch.unsqueeze(input_ids[0][-1], dim=0)), dim=0
+                ),
+                dim=0,
+            )
         input_length = len(input_ids[0])
 
         logits_processor = prepare_logits_processor(
@@ -122,9 +131,6 @@ class GenerationMixin:
                 )
                 logits = outputs.logits
                 past_key_values = outputs.past_key_values
-            logging.debug(
-                f"===> step: {step}, past_key_values: {type(past_key_values)}, {type(past_key_values[0])}"
-            )
 
             if logits_processor:
                 if repetition_penalty > 1.0:
@@ -261,7 +267,7 @@ class GenerationMixin:
         """
         ...
 
-    def generate(self, prompt: str, **kwargs):
+    def generate(self, prompt: str, past_key_values: Optional[Tuple] = None, **kwargs):
         inputs = self.tokenizer(
             prompt,
             return_tensors="pt",
@@ -271,13 +277,46 @@ class GenerationMixin:
 
         input_length = inputs["input_ids"].shape[-1]
 
+        if past_key_values:
+            inputs['attention_mask'] = torch.ones(
+                (
+                    1,
+                    inputs['attention_mask'][0].shape[0]
+                    + past_key_values[0][0].shape[2],
+                ),
+                dtype=torch.long,
+                device=self._device,
+            )
         # overwrite default values with kwargs
         clean_up_tokenization_spaces = kwargs.pop('clean_up_tokenization_spaces', True)
         skip_special_tokens = kwargs.pop("skip_special_tokens", True)
         echo = kwargs.pop("echo", False)
 
         with torch.inference_mode():
-            outputs = self.model.generate(**inputs, **kwargs)[0].tolist()
+            if past_key_values:
+                prefill = self.step_generate(
+                    prompt,
+                    max_new_tokens=2,
+                    past_key_values=past_key_values,
+                    truncate_last_token=True,
+                    **kwargs,
+                )
+                for idx, _ in enumerate(prefill):
+                    logging.debug(
+                        idx, _['past_key_values'][0][0].shape, _['generated_text']
+                    )
+                    if idx == 0:
+                        past_key_values = _['past_key_values']
+
+            logging.debug(f"===> before go into generate: {inputs}")
+            logging.debug(
+                f"===> past_key_values: {past_key_values[0][0].shape}, "
+                f"attn_mask: {inputs['attention_mask'].shape}"
+            )
+            outputs = self.model.generate(
+                past_key_values=past_key_values,
+                **inputs,
+            )[0].tolist()
             text = self.tokenizer.decode(
                 outputs if echo else outputs[input_length:],
                 clean_up_tokenization_spaces=clean_up_tokenization_spaces,
